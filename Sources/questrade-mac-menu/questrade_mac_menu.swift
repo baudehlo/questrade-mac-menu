@@ -561,6 +561,36 @@ final class SnapshotStore: ObservableObject {
     }
 }
 
+// Renders the menu bar label as an NSImage so coloured text (green/red P&L)
+// actually shows up — foregroundStyle on Text inside MenuBarExtra labels is
+// silently ignored by the system.
+private enum MenuBarLabel {
+    static func image(value: String, change: String, positive: Bool) -> NSImage {
+        let font = NSFont.menuBarFont(ofSize: 0)
+        let changeColor: NSColor = positive ? .systemGreen : .systemRed
+
+        let valueAttr: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: NSColor.labelColor,
+        ]
+        let changeAttr: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: changeColor,
+        ]
+
+        let full = NSMutableAttributedString(string: value + "  ", attributes: valueAttr)
+        full.append(NSAttributedString(string: change, attributes: changeAttr))
+
+        let size = full.size()
+        let image = NSImage(size: size, flipped: false) { rect in
+            full.draw(in: rect)
+            return true
+        }
+        image.isTemplate = false
+        return image
+    }
+}
+
 @main
 struct questrade_mac_menu: App {
     @StateObject private var store = SnapshotStore()
@@ -571,11 +601,11 @@ struct questrade_mac_menu: App {
         } label: {
             if let snapshot = store.selectedSnapshot,
                let d = snapshot.data(for: store.selectedCurrency) ?? snapshot.data(for: snapshot.primaryCurrency) {
-                HStack(spacing: 4) {
-                    Text(store.formatCurrency(d.accountValue, currency: d.currency))
-                    Text(store.formatChange(d.dailyChange, currency: d.currency))
-                        .foregroundStyle(d.dailyChange >= 0 ? Color.green : Color.red)
-                }
+                Image(nsImage: MenuBarLabel.image(
+                    value: store.formatCurrency(d.accountValue, currency: d.currency),
+                    change: store.formatChange(d.dailyChange, currency: d.currency),
+                    positive: d.dailyChange >= 0
+                ))
             } else {
                 Text(store.menuBarTitle)
             }
