@@ -49,11 +49,7 @@ jobs:
             echo
             echo "${compare_text}"
             echo
-            echo "### Install"
-            echo "1. Download the DMG below"
-            echo "2. Open it and drag **Questrade Menu** to Applications"
-            echo "3. Launch it — you'll see a **Q** in your menu bar"
-            echo "4. Enter your [Questrade API consumer key](https://www.questrade.com/api/documentation/getting-started) and log in"
+            echo "See the [README](https://github.com/baudehlo/questrade-mac-menu#readme) for setup and usage instructions."
             echo
             echo "> **Note:** This build is arm64 (Apple Silicon) only."
             echo "> If Gatekeeper blocks the app, right-click → Open on first launch."
