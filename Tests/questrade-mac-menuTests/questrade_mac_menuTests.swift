@@ -38,8 +38,15 @@ import Testing
               "currency": "CAD",
               "cash": 1234.56,
               "totalEquity": 50000.0,
-              "marketValue": 48765.44,
-              "dailyProfitLoss": 320.75
+              "marketValue": 48765.44
+            }
+          ],
+          "sodCombinedBalances": [
+            {
+              "currency": "CAD",
+              "cash": 1200.0,
+              "totalEquity": 49500.0,
+              "marketValue": 48300.0
             }
           ]
         }
@@ -53,11 +60,14 @@ import Testing
         #expect(b.cash == 1234.56)
         #expect(b.totalEquity == 50000.0)
         #expect(b.marketValue == 48765.44)
-        #expect(b.dailyProfitLoss == 320.75)
+
+        #expect(response.sodCombinedBalances.count == 1)
+        #expect(response.sodCombinedBalances[0].totalEquity == 49500.0)
     }
 
     @Test func decodesBalancesWithMissingOptionals() throws {
-        let json = #"{"combinedBalances": [{"currency": "USD"}]}"#.data(using: .utf8)!
+        let json = #"{"combinedBalances": [{"currency": "USD"}], "sodCombinedBalances": []}"#
+            .data(using: .utf8)!
 
         let response = try decoder.decode(QuestradeBalancesResponse.self, from: json)
         let b = response.combinedBalances[0]
@@ -66,7 +76,6 @@ import Testing
         #expect(b.cash == nil)
         #expect(b.totalEquity == nil)
         #expect(b.marketValue == nil)
-        #expect(b.dailyProfitLoss == nil)
     }
 
     @Test func decodesMultipleCombinedBalances() throws {
@@ -75,7 +84,8 @@ import Testing
           "combinedBalances": [
             {"currency": "CAD", "totalEquity": 10000.0},
             {"currency": "USD", "totalEquity": 5000.0}
-          ]
+          ],
+          "sodCombinedBalances": []
         }
         """.data(using: .utf8)!
 
@@ -179,17 +189,17 @@ import Testing
     // MARK: - Nil guard
 
     @Test func buildReturnsNilForEmptyBalances() {
-        let balances = QuestradeBalancesResponse(combinedBalances: [])
+        let balances = QuestradeBalancesResponse(combinedBalances: [], sodCombinedBalances: [])
         let positions = QuestradePositionsResponse(positions: [])
         #expect(AccountSnapshot.build(balances: balances, positions: positions) == nil)
     }
 
-    // MARK: - Field mapping
+    // MARK: - Field mapping (single currency)
 
     @Test func buildExtractsAllFields() throws {
         let balances = try decode(balancesJSON(
             currency: "CAD", cash: 500.0, totalEquity: 10500.55,
-            marketValue: 10000.55, dailyProfitLoss: 125.10
+            marketValue: 10000.55, sodTotalEquity: 10375.45
         ))
         let positions = QuestradePositionsResponse(positions: [
             position(symbol: "SHOP", marketValue: 1500.0, openPnl:  100.0),
@@ -197,78 +207,138 @@ import Testing
         ])
 
         let snapshot = try #require(AccountSnapshot.build(balances: balances, positions: positions))
+        let d = try #require(snapshot.data(for: "CAD"))
 
-        #expect(snapshot.currency == "CAD")
-        #expect(snapshot.accountValue == 10500.55)
-        #expect(snapshot.cash == 500.0)
-        #expect(snapshot.marketValue == 10000.55)
-        #expect(snapshot.dailyChange == 125.10)
-        #expect(abs(snapshot.openPnl - 70.0) < 0.001)
+        #expect(d.currency == "CAD")
+        #expect(d.accountValue == 10500.55)
+        #expect(d.cash == 500.0)
+        #expect(d.marketValue == 10000.55)
+        #expect(abs(d.dailyChange - 125.10) < 0.001)
+        #expect(abs(d.openPnl - 70.0) < 0.001)
     }
 
     @Test func buildUsesTotalEquityOverMarketValueForAccountValue() throws {
         let balances = try decode(balancesJSON(
             currency: "CAD", cash: nil, totalEquity: 9999.0,
-            marketValue: 8000.0, dailyProfitLoss: nil
+            marketValue: 8000.0, sodTotalEquity: nil
         ))
-
         let snapshot = try #require(AccountSnapshot.build(
             balances: balances, positions: .init(positions: [])
         ))
-
-        #expect(snapshot.accountValue == 9999.0)
+        #expect(snapshot.data(for: "CAD")?.accountValue == 9999.0)
     }
 
     @Test func buildFallsBackToMarketValueWhenTotalEquityIsNil() throws {
         let balances = try decode(balancesJSON(
             currency: "USD", cash: nil, totalEquity: nil,
-            marketValue: 7500.0, dailyProfitLoss: nil
+            marketValue: 7500.0, sodTotalEquity: nil
         ))
-
         let snapshot = try #require(AccountSnapshot.build(
             balances: balances, positions: .init(positions: [])
         ))
-
-        #expect(snapshot.accountValue == 7500.0)
+        #expect(snapshot.data(for: "USD")?.accountValue == 7500.0)
     }
 
     @Test func buildDefaultsCashToZeroWhenNil() throws {
         let balances = try decode(balancesJSON(
             currency: "CAD", cash: nil, totalEquity: 5000.0,
-            marketValue: nil, dailyProfitLoss: nil
+            marketValue: nil, sodTotalEquity: nil
         ))
-
         let snapshot = try #require(AccountSnapshot.build(
             balances: balances, positions: .init(positions: [])
         ))
-
-        #expect(snapshot.cash == 0.0)
+        #expect(snapshot.data(for: "CAD")?.cash == 0.0)
     }
 
     @Test func buildDefaultsMarketValueToZeroWhenNil() throws {
         let balances = try decode(balancesJSON(
             currency: "CAD", cash: nil, totalEquity: 5000.0,
-            marketValue: nil, dailyProfitLoss: nil
+            marketValue: nil, sodTotalEquity: nil
         ))
-
         let snapshot = try #require(AccountSnapshot.build(
             balances: balances, positions: .init(positions: [])
         ))
-
-        #expect(snapshot.marketValue == 0.0)
+        #expect(snapshot.data(for: "CAD")?.marketValue == 0.0)
     }
 
-    @Test func buildDefaultsDailyChangeToZeroWhenNil() throws {
-        let balances = try decode(balancesJSON(
-            currency: "CAD", cash: nil, totalEquity: 5000.0,
-            marketValue: nil, dailyProfitLoss: nil
-        ))
+    // MARK: - Multi-currency
 
+    @Test func buildExposesAllAvailableCurrencies() throws {
+        let json = #"""
+        {
+          "combinedBalances": [
+            {"currency": "CAD", "totalEquity": 50000.0},
+            {"currency": "USD", "totalEquity": 20000.0}
+          ],
+          "sodCombinedBalances": []
+        }
+        """#.data(using: .utf8)!
+        let balances = try JSONDecoder().decode(QuestradeBalancesResponse.self, from: json)
         let snapshot = try #require(AccountSnapshot.build(
             balances: balances, positions: .init(positions: [])
         ))
 
-        #expect(snapshot.dailyChange == 0.0)
+        // CAD has higher equity so it should appear first
+        #expect(snapshot.availableCurrencies == ["CAD", "USD"])
+        #expect(snapshot.primaryCurrency == "CAD")
+        #expect(snapshot.data(for: "USD")?.accountValue == 20000.0)
+    }
+
+    @Test func buildMatchesSodBalanceByCurrency() throws {
+        let json = #"""
+        {
+          "combinedBalances": [
+            {"currency": "CAD", "totalEquity": 50000.0},
+            {"currency": "USD", "totalEquity": 20000.0}
+          ],
+          "sodCombinedBalances": [
+            {"currency": "CAD", "totalEquity": 49000.0},
+            {"currency": "USD", "totalEquity": 19500.0}
+          ]
+        }
+        """#.data(using: .utf8)!
+        let balances = try JSONDecoder().decode(QuestradeBalancesResponse.self, from: json)
+        let snapshot = try #require(AccountSnapshot.build(
+            balances: balances, positions: .init(positions: [])
+        ))
+
+        #expect(abs((snapshot.data(for: "CAD")?.dailyChange ?? 0) - 1000.0) < 0.001)
+        #expect(abs((snapshot.data(for: "USD")?.dailyChange ?? 0) - 500.0) < 0.001)
+    }
+
+    // MARK: - Daily change computed from SOD balances
+
+    @Test func buildComputesDailyChangeFromSodEquity() throws {
+        let balances = try decode(balancesJSON(
+            currency: "CAD", cash: nil, totalEquity: 10500.0,
+            marketValue: nil, sodTotalEquity: 10000.0
+        ))
+        let snapshot = try #require(AccountSnapshot.build(
+            balances: balances, positions: .init(positions: [])
+        ))
+        #expect(abs((snapshot.data(for: "CAD")?.dailyChange ?? 0) - 500.0) < 0.001)
+    }
+
+    @Test func buildDailyChangeIsNegativeWhenEquityDeclined() throws {
+        let balances = try decode(balancesJSON(
+            currency: "CAD", cash: nil, totalEquity: 9500.0,
+            marketValue: nil, sodTotalEquity: 10000.0
+        ))
+        let snapshot = try #require(AccountSnapshot.build(
+            balances: balances, positions: .init(positions: [])
+        ))
+        #expect(abs((snapshot.data(for: "CAD")?.dailyChange ?? 0) - (-500.0)) < 0.001)
+    }
+
+    @Test func buildDailyChangeIsZeroWhenNoSodData() throws {
+        let balances = try decode(balancesJSON(
+            currency: "CAD", cash: nil, totalEquity: 5000.0,
+            marketValue: nil, sodTotalEquity: nil
+        ))
+        let snapshot = try #require(AccountSnapshot.build(
+            balances: balances, positions: .init(positions: [])
+        ))
+        #expect(snapshot.data(for: "CAD")?.dailyChange == 0.0)
     }
 
     // MARK: - Open P&L
@@ -276,46 +346,40 @@ import Testing
     @Test func buildSumsOpenPnlFromPositions() throws {
         let balances = try decode(balancesJSON(
             currency: "CAD", cash: nil, totalEquity: 5000.0,
-            marketValue: nil, dailyProfitLoss: nil
+            marketValue: nil, sodTotalEquity: nil
         ))
         let positions = QuestradePositionsResponse(positions: [
             position(symbol: "A", marketValue: 1000.0, openPnl:  200.0),
             position(symbol: "B", marketValue:  800.0, openPnl:  -75.0),
             position(symbol: "C", marketValue:  600.0, openPnl:   25.0),
         ])
-
         let snapshot = try #require(AccountSnapshot.build(balances: balances, positions: positions))
-
-        #expect(abs(snapshot.openPnl - 150.0) < 0.001)
+        #expect(abs((snapshot.data(for: "CAD")?.openPnl ?? 0) - 150.0) < 0.001)
     }
 
     @Test func buildTreatsNilOpenPnlAsZero() throws {
         let balances = try decode(balancesJSON(
             currency: "CAD", cash: nil, totalEquity: 5000.0,
-            marketValue: nil, dailyProfitLoss: nil
+            marketValue: nil, sodTotalEquity: nil
         ))
         let positions = QuestradePositionsResponse(positions: [
             position(symbol: "A", marketValue: 1000.0, openPnl:  100.0),
             position(symbol: "B", marketValue:  800.0, openPnl:  nil),   // nil → 0
             position(symbol: "C", marketValue:  600.0, openPnl:  -50.0),
         ])
-
         let snapshot = try #require(AccountSnapshot.build(balances: balances, positions: positions))
-
-        #expect(abs(snapshot.openPnl - 50.0) < 0.001)
+        #expect(abs((snapshot.data(for: "CAD")?.openPnl ?? 0) - 50.0) < 0.001)
     }
 
     @Test func buildOpenPnlIsZeroWithEmptyPositions() throws {
         let balances = try decode(balancesJSON(
             currency: "CAD", cash: nil, totalEquity: 5000.0,
-            marketValue: nil, dailyProfitLoss: nil
+            marketValue: nil, sodTotalEquity: nil
         ))
-
         let snapshot = try #require(AccountSnapshot.build(
             balances: balances, positions: .init(positions: [])
         ))
-
-        #expect(snapshot.openPnl == 0.0)
+        #expect(snapshot.data(for: "CAD")?.openPnl == 0.0)
     }
 
     // MARK: - Top positions sorting and limiting
@@ -323,58 +387,50 @@ import Testing
     @Test func buildSortsPositionsByMarketValueDescending() throws {
         let balances = try decode(balancesJSON(
             currency: "CAD", cash: nil, totalEquity: 5000.0,
-            marketValue: nil, dailyProfitLoss: nil
+            marketValue: nil, sodTotalEquity: nil
         ))
         let positions = QuestradePositionsResponse(positions: [
             position(symbol: "SMALL",  marketValue:  100.0, openPnl: nil),
             position(symbol: "LARGE",  marketValue: 3000.0, openPnl: nil),
             position(symbol: "MEDIUM", marketValue: 1500.0, openPnl: nil),
         ])
-
         let snapshot = try #require(AccountSnapshot.build(balances: balances, positions: positions))
-
         #expect(snapshot.topPositions.map(\.symbol) == ["LARGE", "MEDIUM", "SMALL"])
     }
 
     @Test func buildDefaultsTopLimitToFive() throws {
         let balances = try decode(balancesJSON(
             currency: "CAD", cash: nil, totalEquity: 5000.0,
-            marketValue: nil, dailyProfitLoss: nil
+            marketValue: nil, sodTotalEquity: nil
         ))
         let positions = QuestradePositionsResponse(
             positions: (1...8).map { position(symbol: "S\($0)", marketValue: Double($0) * 100, openPnl: nil) }
         )
-
         let snapshot = try #require(AccountSnapshot.build(balances: balances, positions: positions))
-
         #expect(snapshot.topPositions.count == 5)
     }
 
     @Test func buildRespectsCustomTopLimit() throws {
         let balances = try decode(balancesJSON(
             currency: "CAD", cash: nil, totalEquity: 5000.0,
-            marketValue: nil, dailyProfitLoss: nil
+            marketValue: nil, sodTotalEquity: nil
         ))
         let positions = QuestradePositionsResponse(
             positions: (1...6).map { position(symbol: "S\($0)", marketValue: Double($0) * 100, openPnl: nil) }
         )
-
         let snapshot = try #require(AccountSnapshot.build(balances: balances, positions: positions, topLimit: 3))
-
         #expect(snapshot.topPositions.count == 3)
     }
 
     @Test func buildWithFewerPositionsThanLimit() throws {
         let balances = try decode(balancesJSON(
             currency: "CAD", cash: nil, totalEquity: 5000.0,
-            marketValue: nil, dailyProfitLoss: nil
+            marketValue: nil, sodTotalEquity: nil
         ))
         let positions = QuestradePositionsResponse(positions: [
             position(symbol: "ONLY", marketValue: 500.0, openPnl: nil),
         ])
-
         let snapshot = try #require(AccountSnapshot.build(balances: balances, positions: positions))
-
         #expect(snapshot.topPositions.count == 1)
         #expect(snapshot.topPositions[0].symbol == "ONLY")
     }
@@ -382,13 +438,11 @@ import Testing
     @Test func buildWithEmptyPositionsHasNoTopPositions() throws {
         let balances = try decode(balancesJSON(
             currency: "CAD", cash: 1000.0, totalEquity: 1000.0,
-            marketValue: nil, dailyProfitLoss: 0.0
+            marketValue: nil, sodTotalEquity: 1000.0
         ))
-
         let snapshot = try #require(AccountSnapshot.build(
             balances: balances, positions: .init(positions: [])
         ))
-
         #expect(snapshot.topPositions.isEmpty)
     }
 
@@ -403,14 +457,21 @@ import Testing
         cash: Double?,
         totalEquity: Double?,
         marketValue: Double?,
-        dailyProfitLoss: Double?
+        sodTotalEquity: Double?
     ) -> Data {
         var fields = [#""currency": "\#(currency)""#]
-        if let v = cash            { fields.append(#""cash": \#(v)"#) }
-        if let v = totalEquity     { fields.append(#""totalEquity": \#(v)"#) }
-        if let v = marketValue     { fields.append(#""marketValue": \#(v)"#) }
-        if let v = dailyProfitLoss { fields.append(#""dailyProfitLoss": \#(v)"#) }
-        return #"{"combinedBalances": [{\#(fields.joined(separator: ", "))}]}"#
+        if let v = cash        { fields.append(#""cash": \#(v)"#) }
+        if let v = totalEquity { fields.append(#""totalEquity": \#(v)"#) }
+        if let v = marketValue { fields.append(#""marketValue": \#(v)"#) }
+
+        let sodSection: String
+        if let sod = sodTotalEquity {
+            sodSection = #"[{"currency": "\#(currency)", "totalEquity": \#(sod)}]"#
+        } else {
+            sodSection = "[]"
+        }
+
+        return #"{"combinedBalances": [{\#(fields.joined(separator: ", "))}], "sodCombinedBalances": \#(sodSection)}"#
             .data(using: .utf8)!
     }
 
@@ -428,4 +489,3 @@ import Testing
         )
     }
 }
-

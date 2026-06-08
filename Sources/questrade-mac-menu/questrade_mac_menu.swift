@@ -22,21 +22,37 @@ struct QuestradeTokenResponse: Decodable {
 
 struct QuestradeBalancesResponse: Decodable {
     let combinedBalances: [CombinedBalance]
+    let sodCombinedBalances: [CombinedBalance]
+    let perCurrencyBalances: [CombinedBalance]
+
+    // Memberwise init — perCurrencyBalances defaults to [] for tests/previews
+    init(
+        combinedBalances: [CombinedBalance],
+        sodCombinedBalances: [CombinedBalance],
+        perCurrencyBalances: [CombinedBalance] = []
+    ) {
+        self.combinedBalances = combinedBalances
+        self.sodCombinedBalances = sodCombinedBalances
+        self.perCurrencyBalances = perCurrencyBalances
+    }
+
+    // Custom decoder so perCurrencyBalances defaults to [] when absent in JSON
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        combinedBalances    = try c.decode([CombinedBalance].self, forKey: .combinedBalances)
+        sodCombinedBalances = try c.decode([CombinedBalance].self, forKey: .sodCombinedBalances)
+        perCurrencyBalances = try c.decodeIfPresent([CombinedBalance].self, forKey: .perCurrencyBalances) ?? []
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case combinedBalances, sodCombinedBalances, perCurrencyBalances
+    }
 
     struct CombinedBalance: Decodable {
         let currency: String
         let cash: Double?
         let totalEquity: Double?
         let marketValue: Double?
-        let dailyProfitLoss: Double?
-
-        enum CodingKeys: String, CodingKey {
-            case currency
-            case cash
-            case totalEquity
-            case marketValue
-            case dailyProfitLoss
-        }
     }
 }
 
@@ -74,36 +90,79 @@ struct QuestradeAccountsResponse: Decodable {
 }
 
 struct AccountSnapshot: Equatable {
-    let accountValue: Double
-    let cash: Double
-    let marketValue: Double
-    let dailyChange: Double
-    let openPnl: Double
+    struct CurrencyData: Equatable {
+        let currency: String
+        let accountValue: Double
+        let cash: Double
+        let marketValue: Double
+        let dailyChange: Double
+        let openPnl: Double
+    }
+
     let topPositions: [QuestradePositionsResponse.Position]
-    let currency: String
+    let currencyData: [String: CurrencyData]   // keyed by currency code
+    let availableCurrencies: [String]           // ordered: highest equity first
+
+    // Convenience: data for a chosen currency, defaulting to highest-equity one
+    func data(for currency: String) -> CurrencyData? { currencyData[currency] }
+    var primaryCurrency: String { availableCurrencies.first ?? "CAD" }
 
     static func build(
         balances: QuestradeBalancesResponse,
         positions: QuestradePositionsResponse,
         topLimit: Int = 5
     ) -> AccountSnapshot? {
-        guard let primaryBalance = balances.combinedBalances.first else {
-            return nil
-        }
+        guard !balances.combinedBalances.isEmpty else { return nil }
+
+        let sortedBalances = balances.combinedBalances
+            .sorted { ($0.totalEquity ?? 0) > ($1.totalEquity ?? 0) }
 
         let sortedPositions = positions.positions
             .sorted { abs($0.currentMarketValue) > abs($1.currentMarketValue) }
 
-        let openPnl = positions.positions.reduce(0.0) { $0 + ($1.openPnl ?? 0) }
+        // Sum position openPnl — values are in the positions' own currency (USD for
+        // US-listed stocks). We derive an implied secondary→primary FX rate from
+        // perCurrencyBalances vs combinedBalances to convert correctly.
+        let positionOpenPnl = positions.positions.reduce(0.0) { $0 + ($1.openPnl ?? 0) }
+
+        let primaryBalance = sortedBalances[0]
+        let primaryPerCurrencyMV = balances.perCurrencyBalances
+            .first { $0.currency == primaryBalance.currency }?.marketValue ?? 0
+        let secondaryPerCurrencyMV = balances.perCurrencyBalances
+            .filter { $0.currency != primaryBalance.currency }
+            .reduce(0.0) { $0 + ($1.marketValue ?? 0) }
+        // rate converts secondary-currency (USD) amounts into the primary currency (CAD)
+        let impliedRate: Double = secondaryPerCurrencyMV > 0
+            ? ((primaryBalance.marketValue ?? 0) - primaryPerCurrencyMV) / secondaryPerCurrencyMV
+            : 1.0
+
+        var currencyData: [String: AccountSnapshot.CurrencyData] = [:]
+        for balance in sortedBalances {
+            let currentEquity = balance.totalEquity ?? balance.marketValue ?? 0
+            let sodBalance = balances.sodCombinedBalances
+                .first { $0.currency == balance.currency }
+            let sodEquity = sodBalance?.totalEquity ?? sodBalance?.marketValue ?? currentEquity
+            let dailyChange = currentEquity - sodEquity
+            // Primary currency: positions are in secondary currency, apply implied rate.
+            // Secondary currency: positions are already denominated in that currency.
+            let openPnl = balance.currency == primaryBalance.currency
+                ? positionOpenPnl * impliedRate
+                : positionOpenPnl
+
+            currencyData[balance.currency] = AccountSnapshot.CurrencyData(
+                currency: balance.currency,
+                accountValue: currentEquity,
+                cash: balance.cash ?? 0,
+                marketValue: balance.marketValue ?? 0,
+                dailyChange: dailyChange,
+                openPnl: openPnl
+            )
+        }
 
         return AccountSnapshot(
-            accountValue: primaryBalance.totalEquity ?? primaryBalance.marketValue ?? 0,
-            cash: primaryBalance.cash ?? 0,
-            marketValue: primaryBalance.marketValue ?? 0,
-            dailyChange: primaryBalance.dailyProfitLoss ?? 0,
-            openPnl: openPnl,
             topPositions: Array(sortedPositions.prefix(topLimit)),
-            currency: primaryBalance.currency
+            currencyData: currencyData,
+            availableCurrencies: sortedBalances.map(\.currency)
         )
     }
 }
@@ -130,11 +189,17 @@ actor QuestradeClient {
 
     private let config: Config
     private let session: URLSession
+    private let onTokenRotated: @Sendable (String) -> Void
     private var state: SessionState?
 
-    init(config: Config, session: URLSession = .shared) {
+    init(
+        config: Config,
+        session: URLSession = .shared,
+        onTokenRotated: @escaping @Sendable (String) -> Void = { _ in }
+    ) {
         self.config = config
         self.session = session
+        self.onTokenRotated = onTokenRotated
     }
 
     func fetchAccounts() async throws -> [QuestradeAccountsResponse.Account] {
@@ -198,6 +263,7 @@ actor QuestradeClient {
             expiryDate: Date().addingTimeInterval(TimeInterval(max(token.expiresIn - 120, 60)))
         )
         state = nextState
+        onTokenRotated(token.refreshToken)
         return nextState
     }
 
@@ -243,7 +309,7 @@ private final class AuthContextProvider: NSObject, ASWebAuthenticationPresentati
 
 @MainActor
 final class SnapshotStore: ObservableObject {
-    private static let refreshTokenKey = "questrade.refreshToken"
+    nonisolated static let refreshTokenKey = "questrade.refreshToken"
     private static let clientIDKey = "questrade.clientID"
 
     @Published var clientID: String {
@@ -254,6 +320,7 @@ final class SnapshotStore: ObservableObject {
     @Published var accounts: [QuestradeAccountsResponse.Account] = []
     @Published var snapshots: [String: AccountSnapshot] = [:]
     @Published var selectedAccountIndex: Int = 0
+    @Published var selectedCurrency: String = "CAD"
     @Published var lastUpdated: Date?
     @Published var errorMessage: String?
     @Published var isLoading = false
@@ -273,6 +340,9 @@ final class SnapshotStore: ObservableObject {
     init() {
         clientID = UserDefaults.standard.string(forKey: Self.clientIDKey) ?? ""
         isAuthenticated = !(UserDefaults.standard.string(forKey: Self.refreshTokenKey) ?? "").isEmpty
+        if isAuthenticated {
+            startPolling()
+        }
     }
 
     deinit {
@@ -409,7 +479,12 @@ final class SnapshotStore: ObservableObject {
         )
 
         if config != activeConfig {
-            client = QuestradeClient(config: config)
+            client = QuestradeClient(config: config, onTokenRotated: { newToken in
+                // Write directly — UserDefaults is thread-safe and this must be
+                // synchronous so the token is never lost if the process terminates
+                // between rotation and an async MainActor task executing.
+                UserDefaults.standard.set(newToken, forKey: SnapshotStore.refreshTokenKey)
+            })
             activeConfig = config
         }
 
@@ -460,8 +535,10 @@ final class SnapshotStore: ObservableObject {
     }
 
     var menuBarTitle: String {
-        guard let snapshot = selectedSnapshot else { return "Questrade" }
-        return formatCurrency(snapshot.accountValue, currency: snapshot.currency)
+        guard let snapshot = selectedSnapshot,
+              let d = snapshot.data(for: selectedCurrency) ?? snapshot.data(for: snapshot.primaryCurrency)
+        else { return "Questrade" }
+        return formatCurrency(d.accountValue, currency: d.currency)
     }
 
     func formatCurrency(_ value: Double, currency: String) -> String {
@@ -492,7 +569,16 @@ struct questrade_mac_menu: App {
         MenuBarExtra {
             MenuBarView(store: store)
         } label: {
-            Text(store.menuBarTitle)
+            if let snapshot = store.selectedSnapshot,
+               let d = snapshot.data(for: store.selectedCurrency) ?? snapshot.data(for: snapshot.primaryCurrency) {
+                HStack(spacing: 4) {
+                    Text(store.formatCurrency(d.accountValue, currency: d.currency))
+                    Text(store.formatChange(d.dailyChange, currency: d.currency))
+                        .foregroundStyle(d.dailyChange >= 0 ? Color.green : Color.red)
+                }
+            } else {
+                Text(store.menuBarTitle)
+            }
         }
         .menuBarExtraStyle(.window)
     }
@@ -511,11 +597,6 @@ struct MenuBarView: View {
         }
         .padding(12)
         .frame(minWidth: 320)
-        .task {
-            if store.isAuthenticated {
-                store.startPolling()
-            }
-        }
     }
 
     @ViewBuilder
@@ -655,13 +736,32 @@ struct MenuBarView: View {
 
     @ViewBuilder
     private func snapshotView(_ snapshot: AccountSnapshot) -> some View {
-        VStack(spacing: 3) {
-            balanceRow("Total equity", value: snapshot.accountValue, currency: snapshot.currency)
-            balanceRow("Cash", value: snapshot.cash, currency: snapshot.currency)
-            balanceRow("Market value", value: snapshot.marketValue, currency: snapshot.currency)
-            Divider().padding(.vertical, 2)
-            changeRow("Open P&L", value: snapshot.openPnl, currency: snapshot.currency)
-            changeRow("Today's P&L", value: snapshot.dailyChange, currency: snapshot.currency)
+        let currencies = snapshot.availableCurrencies
+        let activeCurrency = currencies.contains(store.selectedCurrency)
+            ? store.selectedCurrency
+            : snapshot.primaryCurrency
+
+        VStack(spacing: 6) {
+            if currencies.count > 1 {
+                Picker("Currency", selection: $store.selectedCurrency) {
+                    ForEach(currencies, id: \.self) { c in
+                        Text(c).tag(c)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+            }
+
+            if let d = snapshot.data(for: activeCurrency) {
+                VStack(spacing: 3) {
+                    balanceRow("Total equity", value: d.accountValue, currency: d.currency)
+                    balanceRow("Cash", value: d.cash, currency: d.currency)
+                    balanceRow("Market value", value: d.marketValue, currency: d.currency)
+                    Divider().padding(.vertical, 2)
+                    changeRow("Open P&L", value: d.openPnl, currency: d.currency)
+                    changeRow("Today's P&L", value: d.dailyChange, currency: d.currency)
+                }
+            }
         }
     }
 
