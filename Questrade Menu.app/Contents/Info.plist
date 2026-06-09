@@ -9,7 +9,7 @@
 	<key>CFBundleIconFile</key>
 	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.baudehlo.questrade-mac-menu</string>
+	<string>org.sergeant.qtmacmenu</string>
 	<key>CFBundleName</key>
 	<string>Questrade Menu</string>
 	<key>CFBundlePackageType</key>

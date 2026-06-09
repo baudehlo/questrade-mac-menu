@@ -167,11 +167,20 @@ struct AccountSnapshot: Equatable {
     }
 }
 
-enum QuestradeClientError: Error {
+enum QuestradeClientError: LocalizedError {
     case invalidAuthURL
     case invalidEndpoint
     case invalidResponse
     case missingSnapshotData
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidAuthURL:     return "Could not build the authentication URL."
+        case .invalidEndpoint:   return "Could not build the API request URL."
+        case .invalidResponse:   return "Unexpected response from Questrade API."
+        case .missingSnapshotData: return "Account returned no balance data."
+        }
+    }
 }
 
 actor QuestradeClient {
@@ -527,11 +536,11 @@ final class SnapshotStore: ObservableObject {
 
         if anySucceeded {
             lastUpdated = Date()
-        }
-        if let error = firstError {
-            errorMessage = "Failed to update portfolio: \(error.localizedDescription)"
-        } else {
+            // Only surface an error when every account failed; a single failing
+            // secondary account is not worth alarming the user about.
             errorMessage = nil
+        } else if let error = firstError {
+            errorMessage = "Failed to update portfolio: \(error.localizedDescription)"
         }
     }
 
@@ -691,9 +700,20 @@ struct MenuBarView: View {
         }
 
         if let error = store.errorMessage {
-            Text(error)
-                .font(.caption)
-                .foregroundStyle(.red)
+            HStack(alignment: .top, spacing: 4) {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer()
+                Button {
+                    store.errorMessage = nil
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
         }
 
         Divider()

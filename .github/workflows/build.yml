@@ -102,7 +102,7 @@ jobs:
           set -euo pipefail
           APP_NAME="Questrade Menu"
           BINARY_NAME="questrade-mac-menu"
-          BUNDLE_ID="com.baudehlo.questrade-mac-menu"
+          BUNDLE_ID="org.sergeant.qtmacmenu"
           APP_DIR="${APP_NAME}.app"
           CONTENTS="${APP_DIR}/Contents"
 

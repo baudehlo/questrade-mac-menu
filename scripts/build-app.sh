@@ -7,7 +7,7 @@ set -euo pipefail
 VERSION="${1:-dev}"
 APP_NAME="Questrade Menu"
 BINARY_NAME="questrade-mac-menu"
-BUNDLE_ID="com.baudehlo.questrade-mac-menu"
+BUNDLE_ID="org.sergeant.qtmacmenu"
 DMG_NAME="Questrade-Menu-v${VERSION}.dmg"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
