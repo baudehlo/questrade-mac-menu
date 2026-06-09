@@ -333,7 +333,7 @@ final class SnapshotStore: ObservableObject {
 
     private var pollTask: Task<Void, Never>?
     private var client: QuestradeClient?
-    private var activeConfig: QuestradeClient.Config?
+
     private var authSession: ASWebAuthenticationSession?
     private let contextProvider = AuthContextProvider()
 
@@ -478,14 +478,13 @@ final class SnapshotStore: ObservableObject {
             authTokenURL: URL(string: "https://login.questrade.com/oauth2/token")!
         )
 
-        if config != activeConfig {
+        if client == nil {
             client = QuestradeClient(config: config, onTokenRotated: { newToken in
                 // Write directly — UserDefaults is thread-safe and this must be
                 // synchronous so the token is never lost if the process terminates
                 // between rotation and an async MainActor task executing.
                 UserDefaults.standard.set(newToken, forKey: SnapshotStore.refreshTokenKey)
             })
-            activeConfig = config
         }
 
         guard let client else { return }
@@ -502,29 +501,44 @@ final class SnapshotStore: ObservableObject {
         }
 
         let accountNumbers = accounts.map(\.number)
-        await withTaskGroup(of: (String, AccountSnapshot?).self) { group in
+        var anySucceeded = false
+        var firstError: Error?
+        await withTaskGroup(of: (String, Result<AccountSnapshot, Error>).self) { group in
             for number in accountNumbers {
                 group.addTask {
-                    let snap = try? await c.fetchSnapshot(accountID: number)
-                    return (number, snap)
+                    do {
+                        let snap = try await c.fetchSnapshot(accountID: number)
+                        return (number, .success(snap))
+                    } catch {
+                        return (number, .failure(error))
+                    }
                 }
             }
-            for await (number, snapshot) in group {
-                if let snapshot {
+            for await (number, result) in group {
+                switch result {
+                case .success(let snapshot):
                     snapshots[number] = snapshot
+                    anySucceeded = true
+                case .failure(let error):
+                    if firstError == nil { firstError = error }
                 }
             }
         }
 
-        lastUpdated = Date()
-        errorMessage = nil
+        if anySucceeded {
+            lastUpdated = Date()
+        }
+        if let error = firstError {
+            errorMessage = "Failed to update portfolio: \(error.localizedDescription)"
+        } else {
+            errorMessage = nil
+        }
     }
 
     func logout() {
         pollTask?.cancel()
         pollTask = nil
         client = nil
-        activeConfig = nil
         snapshots = [:]
         accounts = []
         selectedAccountIndex = 0
