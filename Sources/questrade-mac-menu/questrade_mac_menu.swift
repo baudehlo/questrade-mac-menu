@@ -53,6 +53,7 @@ struct QuestradeBalancesResponse: Decodable {
         let cash: Double?
         let totalEquity: Double?
         let marketValue: Double?
+        let isRealTime: Bool?
     }
 }
 
@@ -136,13 +137,21 @@ struct AccountSnapshot: Equatable {
             ? ((primaryBalance.marketValue ?? 0) - primaryPerCurrencyMV) / secondaryPerCurrencyMV
             : 1.0
 
+        // On non-trading days (weekends/holidays), sodCombinedBalances reflects
+        // the previous session's SOD — not the current day's opening — so the
+        // subtraction yields the *previous* session's P&L instead of today's.
+        // Detect this by checking whether at least one current balance is marked
+        // real-time; if none are, the market is closed for the day and we zero
+        // out the daily change.
+        let anyRealTime = balances.combinedBalances.contains { $0.isRealTime == true }
+
         var currencyData: [String: AccountSnapshot.CurrencyData] = [:]
         for balance in sortedBalances {
             let currentEquity = balance.totalEquity ?? balance.marketValue ?? 0
             let sodBalance = balances.sodCombinedBalances
                 .first { $0.currency == balance.currency }
             let sodEquity = sodBalance?.totalEquity ?? sodBalance?.marketValue ?? currentEquity
-            let dailyChange = currentEquity - sodEquity
+            let dailyChange = anyRealTime ? currentEquity - sodEquity : 0.0
             // Primary currency: positions are in secondary currency, apply implied rate.
             // Secondary currency: positions are already denominated in that currency.
             let openPnl = balance.currency == primaryBalance.currency

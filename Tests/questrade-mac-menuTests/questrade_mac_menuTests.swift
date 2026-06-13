@@ -288,8 +288,8 @@ import Testing
         let json = #"""
         {
           "combinedBalances": [
-            {"currency": "CAD", "totalEquity": 50000.0},
-            {"currency": "USD", "totalEquity": 20000.0}
+            {"currency": "CAD", "totalEquity": 50000.0, "isRealTime": true},
+            {"currency": "USD", "totalEquity": 20000.0, "isRealTime": true}
           ],
           "sodCombinedBalances": [
             {"currency": "CAD", "totalEquity": 49000.0},
@@ -334,6 +334,19 @@ import Testing
         let balances = try decode(balancesJSON(
             currency: "CAD", cash: nil, totalEquity: 5000.0,
             marketValue: nil, sodTotalEquity: nil
+        ))
+        let snapshot = try #require(AccountSnapshot.build(
+            balances: balances, positions: .init(positions: [])
+        ))
+        #expect(snapshot.data(for: "CAD")?.dailyChange == 0.0)
+    }
+
+    @Test func buildDailyChangeIsZeroWhenMarketClosed() throws {
+        // On weekends/holidays isRealTime is false — daily change should be 0
+        let balances = try decode(balancesJSON(
+            currency: "CAD", cash: nil, totalEquity: 10500.0,
+            marketValue: nil, sodTotalEquity: 10000.0,
+            isRealTime: false
         ))
         let snapshot = try #require(AccountSnapshot.build(
             balances: balances, positions: .init(positions: [])
@@ -457,12 +470,14 @@ import Testing
         cash: Double?,
         totalEquity: Double?,
         marketValue: Double?,
-        sodTotalEquity: Double?
+        sodTotalEquity: Double?,
+        isRealTime: Bool = true
     ) -> Data {
         var fields = [#""currency": "\#(currency)""#]
         if let v = cash        { fields.append(#""cash": \#(v)"#) }
         if let v = totalEquity { fields.append(#""totalEquity": \#(v)"#) }
         if let v = marketValue { fields.append(#""marketValue": \#(v)"#) }
+        fields.append(#""isRealTime": \#(isRealTime ? "true" : "false")"#)
 
         let sodSection: String
         if let sod = sodTotalEquity {
