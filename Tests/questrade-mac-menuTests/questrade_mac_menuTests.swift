@@ -206,7 +206,7 @@ import Testing
             position(symbol: "AAPL", marketValue: 1200.0, openPnl:  -30.0),
         ])
 
-        let snapshot = try #require(AccountSnapshot.build(balances: balances, positions: positions))
+        let snapshot = try #require(AccountSnapshot.build(balances: balances, positions: positions, now: Self.knownWeekday))
         let d = try #require(snapshot.data(for: "CAD"))
 
         #expect(d.currency == "CAD")
@@ -299,7 +299,7 @@ import Testing
         """#.data(using: .utf8)!
         let balances = try JSONDecoder().decode(QuestradeBalancesResponse.self, from: json)
         let snapshot = try #require(AccountSnapshot.build(
-            balances: balances, positions: .init(positions: [])
+            balances: balances, positions: .init(positions: []), now: Self.knownWeekday
         ))
 
         #expect(abs((snapshot.data(for: "CAD")?.dailyChange ?? 0) - 1000.0) < 0.001)
@@ -314,7 +314,7 @@ import Testing
             marketValue: nil, sodTotalEquity: 10000.0
         ))
         let snapshot = try #require(AccountSnapshot.build(
-            balances: balances, positions: .init(positions: [])
+            balances: balances, positions: .init(positions: []), now: Self.knownWeekday
         ))
         #expect(abs((snapshot.data(for: "CAD")?.dailyChange ?? 0) - 500.0) < 0.001)
     }
@@ -325,7 +325,7 @@ import Testing
             marketValue: nil, sodTotalEquity: 10000.0
         ))
         let snapshot = try #require(AccountSnapshot.build(
-            balances: balances, positions: .init(positions: [])
+            balances: balances, positions: .init(positions: []), now: Self.knownWeekday
         ))
         #expect(abs((snapshot.data(for: "CAD")?.dailyChange ?? 0) - (-500.0)) < 0.001)
     }
@@ -341,15 +341,27 @@ import Testing
         #expect(snapshot.data(for: "CAD")?.dailyChange == 0.0)
     }
 
-    @Test func buildDailyChangeIsZeroWhenMarketClosed() throws {
-        // On weekends/holidays isRealTime is false — daily change should be 0
+    @Test func buildDailyChangeIsZeroWhenIsRealTimeFalse() throws {
+        // When isRealTime is false on a weekday (e.g. holiday), daily change should be 0
         let balances = try decode(balancesJSON(
             currency: "CAD", cash: nil, totalEquity: 10500.0,
             marketValue: nil, sodTotalEquity: 10000.0,
             isRealTime: false
         ))
         let snapshot = try #require(AccountSnapshot.build(
-            balances: balances, positions: .init(positions: [])
+            balances: balances, positions: .init(positions: []), now: Self.knownWeekday
+        ))
+        #expect(snapshot.data(for: "CAD")?.dailyChange == 0.0)
+    }
+
+    @Test func buildDailyChangeIsZeroOnWeekend() throws {
+        // On weekends sodCombinedBalances is stale (Friday SOD) — daily change should be 0
+        let balances = try decode(balancesJSON(
+            currency: "CAD", cash: nil, totalEquity: 10500.0,
+            marketValue: nil, sodTotalEquity: 10000.0
+        ))
+        let snapshot = try #require(AccountSnapshot.build(
+            balances: balances, positions: .init(positions: []), now: Self.knownWeekend
         ))
         #expect(snapshot.data(for: "CAD")?.dailyChange == 0.0)
     }
@@ -460,6 +472,22 @@ import Testing
     }
 
     // MARK: - Helpers
+
+    // Mon 2025-06-09 14:00 ET — a known weekday during market hours
+    private static let knownWeekday: Date = {
+        var c = DateComponents()
+        c.year = 2025; c.month = 6; c.day = 9; c.hour = 14
+        c.timeZone = TimeZone(identifier: "America/New_York")
+        return Calendar(identifier: .gregorian).date(from: c)!
+    }()
+
+    // Sat 2025-06-14 14:00 ET — a known weekend day
+    private static let knownWeekend: Date = {
+        var c = DateComponents()
+        c.year = 2025; c.month = 6; c.day = 14; c.hour = 14
+        c.timeZone = TimeZone(identifier: "America/New_York")
+        return Calendar(identifier: .gregorian).date(from: c)!
+    }()
 
     private func decode(_ data: Data) throws -> QuestradeBalancesResponse {
         try JSONDecoder().decode(QuestradeBalancesResponse.self, from: data)

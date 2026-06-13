@@ -111,7 +111,8 @@ struct AccountSnapshot: Equatable {
     static func build(
         balances: QuestradeBalancesResponse,
         positions: QuestradePositionsResponse,
-        topLimit: Int = 5
+        topLimit: Int = 5,
+        now: Date = Date()
     ) -> AccountSnapshot? {
         guard !balances.combinedBalances.isEmpty else { return nil }
 
@@ -140,10 +141,13 @@ struct AccountSnapshot: Equatable {
         // On non-trading days (weekends/holidays), sodCombinedBalances reflects
         // the previous session's SOD — not the current day's opening — so the
         // subtraction yields the *previous* session's P&L instead of today's.
-        // Detect this by checking whether at least one current balance is marked
-        // real-time; if none are, the market is closed for the day and we zero
-        // out the daily change.
+        // Use Eastern time (market timezone) to detect weekends, and also check
+        // isRealTime as a secondary signal for mid-week holidays.
+        var easternCalendar = Calendar(identifier: .gregorian)
+        easternCalendar.timeZone = TimeZone(identifier: "America/New_York")!
+        let isWeekend = easternCalendar.isDateInWeekend(now)
         let anyRealTime = balances.combinedBalances.contains { $0.isRealTime == true }
+        let isMarketDay = !isWeekend && anyRealTime
 
         var currencyData: [String: AccountSnapshot.CurrencyData] = [:]
         for balance in sortedBalances {
@@ -151,7 +155,7 @@ struct AccountSnapshot: Equatable {
             let sodBalance = balances.sodCombinedBalances
                 .first { $0.currency == balance.currency }
             let sodEquity = sodBalance?.totalEquity ?? sodBalance?.marketValue ?? currentEquity
-            let dailyChange = anyRealTime ? currentEquity - sodEquity : 0.0
+            let dailyChange = isMarketDay ? currentEquity - sodEquity : 0.0
             // Primary currency: positions are in secondary currency, apply implied rate.
             // Secondary currency: positions are already denominated in that currency.
             let openPnl = balance.currency == primaryBalance.currency
