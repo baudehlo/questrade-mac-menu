@@ -62,6 +62,7 @@ struct QuestradePositionsResponse: Decodable {
 
     struct Position: Decodable, Equatable {
         let symbol: String
+        let symbolId: Int?
         let openQuantity: Double
         let currentMarketValue: Double
         let currentPrice: Double?
@@ -69,11 +70,22 @@ struct QuestradePositionsResponse: Decodable {
 
         enum CodingKeys: String, CodingKey {
             case symbol
+            case symbolId
             case openQuantity
             case currentMarketValue
             case currentPrice
             case openPnl
         }
+    }
+}
+
+struct QuestradeQuotesResponse: Decodable {
+    let quotes: [Quote]
+
+    struct Quote: Decodable {
+        let symbolId: Int
+        let lastTradePrice: Double?
+        let prevDayClosePrice: Double?
     }
 }
 
@@ -111,6 +123,7 @@ struct AccountSnapshot: Equatable {
     static func build(
         balances: QuestradeBalancesResponse,
         positions: QuestradePositionsResponse,
+        quotes: [QuestradeQuotesResponse.Quote]? = nil,
         topLimit: Int = 5,
         now: Date = Date()
     ) -> AccountSnapshot? {
@@ -149,13 +162,40 @@ struct AccountSnapshot: Equatable {
         let anyRealTime = balances.combinedBalances.contains { $0.isRealTime == true }
         let isMarketDay = !isWeekend && anyRealTime
 
+        // On weekend evenings with real-time data (futures active), compute P&L from
+        // quotes: (lastTradePrice - prevDayClosePrice) × openQuantity, summed in USD,
+        // then converted to CAD using the same impliedRate. Positions without a matching
+        // quote or missing prevDayClosePrice contribute 0 (graceful degradation).
+        let quoteDailyPnl: Double? = quotes.map { quoteList in
+            let quoteMap = Dictionary(uniqueKeysWithValues: quoteList.map { ($0.symbolId, $0) })
+            return positions.positions.reduce(0.0) { sum, position in
+                guard
+                    let id = position.symbolId,
+                    let quote = quoteMap[id],
+                    let last = quote.lastTradePrice,
+                    let prevClose = quote.prevDayClosePrice
+                else { return sum }
+                return sum + (last - prevClose) * position.openQuantity
+            }
+        }
+
         var currencyData: [String: AccountSnapshot.CurrencyData] = [:]
         for balance in sortedBalances {
             let currentEquity = balance.totalEquity ?? balance.marketValue ?? 0
             let sodBalance = balances.sodCombinedBalances
                 .first { $0.currency == balance.currency }
             let sodEquity = sodBalance?.totalEquity ?? sodBalance?.marketValue ?? currentEquity
-            let dailyChange = isMarketDay ? currentEquity - sodEquity : 0.0
+
+            let dailyChange: Double
+            if let quotePnl = quoteDailyPnl {
+                // Weekend with active futures: use quote-based P&L converted to this currency
+                dailyChange = balance.currency == primaryBalance.currency
+                    ? quotePnl * impliedRate
+                    : quotePnl
+            } else {
+                dailyChange = isMarketDay ? currentEquity - sodEquity : 0.0
+            }
+
             // Primary currency: positions are in secondary currency, apply implied rate.
             // Secondary currency: positions are already denominated in that currency.
             let openPnl = balance.currency == primaryBalance.currency
@@ -237,16 +277,40 @@ actor QuestradeClient {
 
     func fetchSnapshot(accountID: String) async throws -> AccountSnapshot {
         let activeState = try await validState(forceRefresh: false)
-        let balances: QuestradeBalancesResponse = try await requestJSON(
+        async let balancesFetch: QuestradeBalancesResponse = requestJSON(
             path: "/v1/accounts/\(accountID)/balances",
             state: activeState
         )
-        let positions: QuestradePositionsResponse = try await requestJSON(
+        async let positionsFetch: QuestradePositionsResponse = requestJSON(
             path: "/v1/accounts/\(accountID)/positions",
             state: activeState
         )
+        let (balances, positions) = try await (balancesFetch, positionsFetch)
 
-        guard let snapshot = AccountSnapshot.build(balances: balances, positions: positions) else {
+        // On weekend evenings, futures can move and Questrade shows non-zero Today's P&L.
+        // The SOD-balance approach would give P&L since Friday's SOD (wrong), so instead
+        // fetch quotes and compute (lastTradePrice - prevDayClosePrice) × openQuantity.
+        var easternCalendar = Calendar(identifier: .gregorian)
+        easternCalendar.timeZone = TimeZone(identifier: "America/New_York")!
+        let isWeekend = easternCalendar.isDateInWeekend(Date())
+        let anyRealTime = balances.combinedBalances.contains { $0.isRealTime == true }
+
+        var quotes: [QuestradeQuotesResponse.Quote]? = nil
+        if isWeekend && anyRealTime {
+            let symbolIds = positions.positions
+                .filter { $0.openQuantity != 0 }
+                .compactMap(\.symbolId)
+            if !symbolIds.isEmpty {
+                let idsParam = symbolIds.map(String.init).joined(separator: ",")
+                let quotesResponse: QuestradeQuotesResponse = try await requestJSON(
+                    path: "/v1/markets/quotes?ids=\(idsParam)",
+                    state: activeState
+                )
+                quotes = quotesResponse.quotes
+            }
+        }
+
+        guard let snapshot = AccountSnapshot.build(balances: balances, positions: positions, quotes: quotes) else {
             throw QuestradeClientError.missingSnapshotData
         }
 
