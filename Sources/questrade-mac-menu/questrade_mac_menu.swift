@@ -185,13 +185,15 @@ enum QuestradeClientError: LocalizedError {
     case invalidEndpoint
     case invalidResponse
     case missingSnapshotData
+    case authenticationRequired
 
     var errorDescription: String? {
         switch self {
-        case .invalidAuthURL:     return "Could not build the authentication URL."
-        case .invalidEndpoint:   return "Could not build the API request URL."
-        case .invalidResponse:   return "Unexpected response from Questrade API."
-        case .missingSnapshotData: return "Account returned no balance data."
+        case .invalidAuthURL:         return "Could not build the authentication URL."
+        case .invalidEndpoint:        return "Could not build the API request URL."
+        case .invalidResponse:        return "Unexpected response from Questrade API."
+        case .missingSnapshotData:    return "Account returned no balance data."
+        case .authenticationRequired: return "Session expired. Please log in again."
         }
     }
 }
@@ -274,6 +276,10 @@ actor QuestradeClient {
         let (data, response) = try await session.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse,
               (200..<300).contains(httpResponse.statusCode) else {
+            if let httpResponse = response as? HTTPURLResponse,
+               (400..<500).contains(httpResponse.statusCode) {
+                throw QuestradeClientError.authenticationRequired
+            }
             throw QuestradeClientError.invalidResponse
         }
 
@@ -517,7 +523,8 @@ final class SnapshotStore: ObservableObject {
                 let fetched = try await c.fetchAccounts()
                 accounts = fetched.filter { $0.status == "Active" }
             } catch {
-                errorMessage = "Failed to fetch accounts: \(error.localizedDescription)"
+                self.client = nil
+                handleReloadError(error)
                 return
             }
         }
@@ -553,6 +560,21 @@ final class SnapshotStore: ObservableObject {
             // secondary account is not worth alarming the user about.
             errorMessage = nil
         } else if let error = firstError {
+            self.client = nil
+            handleReloadError(error)
+        }
+    }
+
+    private func handleReloadError(_ error: Error) {
+        if let qtError = error as? QuestradeClientError,
+           case .authenticationRequired = qtError {
+            // Refresh token is expired/revoked — drop back to login screen
+            // (preserves clientID so the user just needs to click Login again)
+            accounts = []
+            snapshots = [:]
+            isAuthenticated = false
+            errorMessage = "Session expired. Please log in again."
+        } else {
             errorMessage = "Failed to update portfolio: \(error.localizedDescription)"
         }
     }
