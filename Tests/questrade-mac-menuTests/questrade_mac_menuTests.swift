@@ -525,6 +525,7 @@ import Testing
     ) -> QuestradePositionsResponse.Position {
         QuestradePositionsResponse.Position(
             symbol: symbol,
+            symbolId: nil,
             openQuantity: 1,
             currentMarketValue: marketValue,
             currentPrice: nil,
