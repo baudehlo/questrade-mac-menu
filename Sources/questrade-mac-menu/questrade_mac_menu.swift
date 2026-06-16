@@ -850,6 +850,9 @@ struct MenuBarView: View {
             }
 
             Spacer()
+            Text("v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev")")
+                .font(.caption)
+                .foregroundStyle(.secondary)
             Button("Logout") { store.logout() }
         }
     }
