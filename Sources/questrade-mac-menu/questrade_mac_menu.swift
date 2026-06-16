@@ -374,6 +374,14 @@ actor QuestradeClient {
         }
 
         if httpResponse.statusCode == 401 {
+            // If another concurrent call already refreshed the token, the actor's
+            // current state will be fresher than `state`. Re-use it rather than
+            // forcing another refresh rotation (which needlessly consumes the token).
+            let current = try await validState(forceRefresh: false)
+            if current.accessToken != state.accessToken {
+                return try await requestJSON(path: path, state: current)
+            }
+            // Our state is still the stale one — force a real refresh.
             let refreshed = try await validState(forceRefresh: true)
             return try await requestJSON(path: path, state: refreshed)
         }
@@ -587,7 +595,12 @@ final class SnapshotStore: ObservableObject {
                 let fetched = try await c.fetchAccounts()
                 accounts = fetched.filter { $0.status == "Active" }
             } catch {
-                self.client = nil
+                // Only discard the client on auth failures; preserve it for transient
+                // errors so the actor retains its valid (possibly just-rotated) token state.
+                if let qtError = error as? QuestradeClientError,
+                   case .authenticationRequired = qtError {
+                    self.client = nil
+                }
                 handleReloadError(error)
                 return
             }
@@ -624,7 +637,10 @@ final class SnapshotStore: ObservableObject {
             // secondary account is not worth alarming the user about.
             errorMessage = nil
         } else if let error = firstError {
-            self.client = nil
+            if let qtError = error as? QuestradeClientError,
+               case .authenticationRequired = qtError {
+                self.client = nil
+            }
             handleReloadError(error)
         }
     }
