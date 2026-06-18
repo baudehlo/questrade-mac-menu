@@ -226,6 +226,7 @@ enum QuestradeClientError: LocalizedError {
     case invalidResponse
     case missingSnapshotData
     case authenticationRequired
+    case tokenServiceUnavailable
 
     var errorDescription: String? {
         switch self {
@@ -234,6 +235,8 @@ enum QuestradeClientError: LocalizedError {
         case .invalidResponse:        return "Unexpected response from Questrade API."
         case .missingSnapshotData:    return "Account returned no balance data."
         case .authenticationRequired: return "Session expired. Please log in again."
+        case .tokenServiceUnavailable:
+            return "Questrade authentication is temporarily unavailable."
         }
     }
 }
@@ -242,9 +245,10 @@ actor QuestradeClient {
     struct Config: Equatable {
         let refreshToken: String
         let authTokenURL: URL
+        let clientID: String?
     }
 
-    private struct SessionState {
+    private struct SessionState: Sendable {
         let accessToken: String
         let refreshToken: String
         let apiServer: URL
@@ -255,6 +259,7 @@ actor QuestradeClient {
     private let session: URLSession
     private let onTokenRotated: @Sendable (String) -> Void
     private var state: SessionState?
+    private var refreshTask: Task<SessionState, Error>?
 
     init(
         config: Config,
@@ -324,11 +329,23 @@ actor QuestradeClient {
             return state
         }
 
+        let refreshMode = forceRefresh ? "forced" : "normal"
+
+        if let refreshTask {
+            print("[Auth] Refresh joinInFlight mode=\(refreshMode)")
+            return try await refreshTask.value
+        }
+
         var components = URLComponents(url: config.authTokenURL, resolvingAgainstBaseURL: false)
-        components?.queryItems = [
+        var queryItems = [
             URLQueryItem(name: "grant_type", value: "refresh_token"),
             URLQueryItem(name: "refresh_token", value: state?.refreshToken ?? config.refreshToken)
         ]
+        if let clientID = config.clientID?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !clientID.isEmpty {
+            queryItems.append(URLQueryItem(name: "client_id", value: clientID))
+        }
+        components?.queryItems = queryItems
 
         guard let tokenURL = components?.url else {
             throw QuestradeClientError.invalidAuthURL
@@ -336,27 +353,60 @@ actor QuestradeClient {
 
         var request = URLRequest(url: tokenURL)
         request.httpMethod = "GET"
+        let cachedState = state
+        print("[Auth] Refresh start mode=\(refreshMode) hasCachedState=\(cachedState != nil)")
 
-        let (data, response) = try await session.data(for: request)
-        guard let httpResponse = response as? HTTPURLResponse,
-              (200..<300).contains(httpResponse.statusCode) else {
-            if let httpResponse = response as? HTTPURLResponse,
-               (400..<500).contains(httpResponse.statusCode) {
-                throw QuestradeClientError.authenticationRequired
+        let refreshTask = Task<SessionState, Error> {
+            let (data, response) = try await session.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse,
+                  (200..<300).contains(httpResponse.statusCode) else {
+                if let httpResponse = response as? HTTPURLResponse {
+                    let bodySnippet = String(data: data, encoding: .utf8)?
+                        .replacingOccurrences(of: "\n", with: " ")
+                        .prefix(200) ?? "<non-utf8>"
+                    print("[Auth] Refresh HTTP status=\(httpResponse.statusCode) mode=\(refreshMode) body=\(bodySnippet)")
+                    switch httpResponse.statusCode {
+                    case 400, 401, 403:
+                        print("[Auth] Refresh classified=authenticationRequired")
+                        throw QuestradeClientError.authenticationRequired
+                    case 429, 500...599:
+                        // Transient upstream failure; keep user signed in and retry next poll.
+                        if !forceRefresh, let cachedState {
+                            print("[Auth] Refresh classified=transient recoveredWithCachedState=true")
+                            return cachedState
+                        }
+                        print("[Auth] Refresh classified=transient recoveredWithCachedState=false")
+                        throw QuestradeClientError.tokenServiceUnavailable
+                    default:
+                        print("[Auth] Refresh classified=invalidResponse")
+                        throw QuestradeClientError.invalidResponse
+                    }
+                }
+                print("[Auth] Refresh classified=nonHttpResponse")
+                throw QuestradeClientError.invalidResponse
             }
-            throw QuestradeClientError.invalidResponse
-        }
 
-        let token = try JSONDecoder().decode(QuestradeTokenResponse.self, from: data)
-        let nextState = SessionState(
-            accessToken: token.accessToken,
-            refreshToken: token.refreshToken,
-            apiServer: token.apiServer,
-            expiryDate: Date().addingTimeInterval(TimeInterval(max(token.expiresIn - 120, 60)))
-        )
-        state = nextState
-        onTokenRotated(token.refreshToken)
-        return nextState
+            let token = try JSONDecoder().decode(QuestradeTokenResponse.self, from: data)
+            print("[Auth] Refresh success mode=\(refreshMode) expiresIn=\(token.expiresIn)")
+            onTokenRotated(token.refreshToken)
+            return SessionState(
+                accessToken: token.accessToken,
+                refreshToken: token.refreshToken,
+                apiServer: token.apiServer,
+                expiryDate: Date().addingTimeInterval(TimeInterval(max(token.expiresIn - 120, 60)))
+            )
+        }
+        self.refreshTask = refreshTask
+
+        do {
+            let nextState = try await refreshTask.value
+            state = nextState
+            self.refreshTask = nil
+            return nextState
+        } catch {
+            self.refreshTask = nil
+            throw error
+        }
     }
 
     private func requestJSON<T: Decodable>(path: String, state: SessionState) async throws -> T {
@@ -374,15 +424,18 @@ actor QuestradeClient {
         }
 
         if httpResponse.statusCode == 401 {
+            print("[Auth] API 401 path=\(path) attemptingTokenRecovery=true")
             // If another concurrent call already refreshed the token, the actor's
             // current state will be fresher than `state`. Re-use it rather than
             // forcing another refresh rotation (which needlessly consumes the token).
             let current = try await validState(forceRefresh: false)
             if current.accessToken != state.accessToken {
+                print("[Auth] API 401 recoveredWithExistingRefresh=true")
                 return try await requestJSON(path: path, state: current)
             }
             // Our state is still the stale one — force a real refresh.
             let refreshed = try await validState(forceRefresh: true)
+            print("[Auth] API 401 recoveredWithForcedRefresh=true")
             return try await requestJSON(path: path, state: refreshed)
         }
 
@@ -575,7 +628,8 @@ final class SnapshotStore: ObservableObject {
 
         let config = QuestradeClient.Config(
             refreshToken: storedToken,
-            authTokenURL: URL(string: "https://login.questrade.com/oauth2/token")!
+            authTokenURL: URL(string: "https://login.questrade.com/oauth2/token")!,
+            clientID: clientID
         )
 
         if client == nil {
@@ -654,6 +708,9 @@ final class SnapshotStore: ObservableObject {
             snapshots = [:]
             isAuthenticated = false
             errorMessage = "Session expired. Please log in again."
+        } else if let qtError = error as? QuestradeClientError,
+                  case .tokenServiceUnavailable = qtError {
+            errorMessage = "Questrade auth service is temporarily unavailable. Retrying automatically."
         } else {
             errorMessage = "Failed to update portfolio: \(error.localizedDescription)"
         }
