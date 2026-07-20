@@ -703,11 +703,17 @@ final class SnapshotStore: ObservableObject {
         if let qtError = error as? QuestradeClientError,
            case .authenticationRequired = qtError {
             // Refresh token is expired/revoked — drop back to login screen
-            // (preserves clientID so the user just needs to click Login again)
             accounts = []
             snapshots = [:]
             isAuthenticated = false
-            errorMessage = "Session expired. Please log in again."
+            errorMessage = nil
+            // If the consumer key is already stored, go straight into login
+            // rather than making the user click the button manually.
+            if !clientID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                startOAuthLogin()
+            } else {
+                errorMessage = "Session expired. Please log in again."
+            }
         } else if let qtError = error as? QuestradeClientError,
                   case .tokenServiceUnavailable = qtError {
             errorMessage = "Questrade auth service is temporarily unavailable. Retrying automatically."
