@@ -260,6 +260,19 @@ actor QuestradeClient {
     private let onTokenRotated: @Sendable (String) -> Void
     private var state: SessionState?
     private var refreshTask: Task<SessionState, Error>?
+    private var consecutiveRefreshRejections = 0
+    private static let maxRefreshRejections = 3
+
+    // A genuinely dead refresh token comes back as an OAuth JSON error body
+    // (e.g. {"error": "invalid_grant"}). The login host sits behind a WAF that
+    // can 400/403 a legitimate request (HTML or empty body) — that must not be
+    // mistaken for a revoked token.
+    static func isOAuthErrorBody(_ data: Data) -> Bool {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return false
+        }
+        return object["error"] != nil
+    }
 
     init(
         config: Config,
@@ -367,8 +380,20 @@ actor QuestradeClient {
                     print("[Auth] Refresh HTTP status=\(httpResponse.statusCode) mode=\(refreshMode) body=\(bodySnippet)")
                     switch httpResponse.statusCode {
                     case 400, 401, 403:
-                        print("[Auth] Refresh classified=authenticationRequired")
-                        throw QuestradeClientError.authenticationRequired
+                        // Logging out on a WAF/gateway rejection would discard a
+                        // still-valid token, so require either an explicit OAuth
+                        // error or repeated consecutive rejections before giving up.
+                        if Self.isOAuthErrorBody(data) {
+                            print("[Auth] Refresh classified=authenticationRequired reason=oauthErrorBody")
+                            throw QuestradeClientError.authenticationRequired
+                        }
+                        consecutiveRefreshRejections += 1
+                        if consecutiveRefreshRejections >= Self.maxRefreshRejections {
+                            print("[Auth] Refresh classified=authenticationRequired reason=repeatedRejections count=\(consecutiveRefreshRejections)")
+                            throw QuestradeClientError.authenticationRequired
+                        }
+                        print("[Auth] Refresh classified=transientRejection count=\(consecutiveRefreshRejections)")
+                        throw QuestradeClientError.tokenServiceUnavailable
                     case 429, 500...599:
                         // Transient upstream failure; keep user signed in and retry next poll.
                         if !forceRefresh, let cachedState {
@@ -388,6 +413,7 @@ actor QuestradeClient {
 
             let token = try JSONDecoder().decode(QuestradeTokenResponse.self, from: data)
             print("[Auth] Refresh success mode=\(refreshMode) expiresIn=\(token.expiresIn)")
+            consecutiveRefreshRejections = 0
             onTokenRotated(token.refreshToken)
             return SessionState(
                 accessToken: token.accessToken,
@@ -409,7 +435,11 @@ actor QuestradeClient {
         }
     }
 
-    private func requestJSON<T: Decodable>(path: String, state: SessionState) async throws -> T {
+    private func requestJSON<T: Decodable>(
+        path: String,
+        state: SessionState,
+        authRetriesLeft: Int = 2
+    ) async throws -> T {
         guard let requestURL = URL(string: path, relativeTo: state.apiServer) else {
             throw QuestradeClientError.invalidEndpoint
         }
@@ -424,6 +454,14 @@ actor QuestradeClient {
         }
 
         if httpResponse.statusCode == 401 {
+            // Bounded recovery: a fresh token that still 401s (server-side auth
+            // propagation glitch) must not loop forever — every forced refresh
+            // consumes a single-use rotation, and each rotation is a fresh chance
+            // to lose the chain if its response goes missing.
+            guard authRetriesLeft > 0 else {
+                print("[Auth] API 401 path=\(path) retriesExhausted=true")
+                throw QuestradeClientError.invalidResponse
+            }
             print("[Auth] API 401 path=\(path) attemptingTokenRecovery=true")
             // If another concurrent call already refreshed the token, the actor's
             // current state will be fresher than `state`. Re-use it rather than
@@ -431,12 +469,12 @@ actor QuestradeClient {
             let current = try await validState(forceRefresh: false)
             if current.accessToken != state.accessToken {
                 print("[Auth] API 401 recoveredWithExistingRefresh=true")
-                return try await requestJSON(path: path, state: current)
+                return try await requestJSON(path: path, state: current, authRetriesLeft: authRetriesLeft - 1)
             }
             // Our state is still the stale one — force a real refresh.
             let refreshed = try await validState(forceRefresh: true)
             print("[Auth] API 401 recoveredWithForcedRefresh=true")
-            return try await requestJSON(path: path, state: refreshed)
+            return try await requestJSON(path: path, state: refreshed, authRetriesLeft: authRetriesLeft - 1)
         }
 
         guard (200..<300).contains(httpResponse.statusCode) else {
@@ -449,14 +487,130 @@ actor QuestradeClient {
 
 #if canImport(SwiftUI) && os(macOS)
 import SwiftUI
-import AuthenticationServices
+import WebKit
 
 private let oauthCallbackScheme = "questrademacmenu"
 private let oauthCallbackURL = "questrademacmenu://auth.app"
 
-private final class AuthContextProvider: NSObject, ASWebAuthenticationPresentationContextProviding {
-    func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
-        NSApp.keyWindow ?? NSApp.windows.first ?? NSWindow()
+// Questrade derives the consent page's "device name" from the User-Agent, and its
+// validation rejects the digits Safari's frozen UA puts there ("Mac OS X 10_15_7"),
+// forcing a manual edit on every login. ASWebAuthenticationSession can't override
+// the UA (additionalHeaderFields only allows X-* headers), so login runs in a
+// WKWebView sending a UA with the OS version token stripped.
+private let loginUserAgent =
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Safari/605.1.15"
+
+// With the version-stripped UA, Questrade's parser leaves the device name blank
+// and the consent page shows an empty, confusing text box. Prefill it with a
+// meaningful (digit-free) name. Guarded to the consent page only — the login
+// page's username field is also a text input.
+private let deviceNamePrefillScript = """
+(function () {
+    function fill() {
+        if (!document.body || !document.body.textContent.includes('Authorization requested')) {
+            return false;
+        }
+        var input = document.querySelector('input[type="text"]');
+        if (!input || input.value) { return false; }
+        input.value = 'Questrade Menu Mac';
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        return true;
+    }
+    if (!fill()) {
+        var observer = new MutationObserver(function () {
+            if (fill()) { observer.disconnect(); }
+        });
+        observer.observe(document.documentElement, { childList: true, subtree: true });
+    }
+})();
+"""
+
+@MainActor
+private final class OAuthLoginWindowController: NSObject, WKNavigationDelegate, NSWindowDelegate {
+    private var window: NSWindow?
+    private var completion: ((URL?, (any Error)?) -> Void)?
+    private var previousActivationPolicy: NSApplication.ActivationPolicy = .accessory
+
+    func begin(url: URL, completion: @escaping (URL?, (any Error)?) -> Void) {
+        self.completion = completion
+
+        let config = WKWebViewConfiguration()
+        config.userContentController.addUserScript(WKUserScript(
+            source: deviceNamePrefillScript,
+            injectionTime: .atDocumentEnd,
+            forMainFrameOnly: true
+        ))
+
+        let webView = WKWebView(frame: .zero, configuration: config)
+        webView.customUserAgent = loginUserAgent
+        webView.navigationDelegate = self
+
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 640, height: 760),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "Login with Questrade"
+        window.contentView = webView
+        window.isReleasedWhenClosed = false
+        window.delegate = self
+        window.center()
+        self.window = window
+
+        // As an accessory app (LSUIElement, and SwiftUI marks MenuBarExtra-only
+        // apps accessory even under `swift run`) this process can't reliably become
+        // active, so the window orders front but never takes key focus. Promote to
+        // a regular app while the login window is open; restored on finish/close.
+        previousActivationPolicy = NSApp.activationPolicy()
+        NSApp.setActivationPolicy(.regular)
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate()
+        webView.load(URLRequest(url: url))
+    }
+
+    private func finish(url: URL?, error: (any Error)?) {
+        guard let completion else { return }
+        self.completion = nil
+        if let window {
+            window.delegate = nil
+            window.close()
+            self.window = nil
+        }
+        NSApp.setActivationPolicy(previousActivationPolicy)
+        completion(url, error)
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        decidePolicyFor navigationAction: WKNavigationAction
+    ) async -> WKNavigationActionPolicy {
+        if let url = navigationAction.request.url, url.scheme == oauthCallbackScheme {
+            finish(url: url, error: nil)
+            return .cancel
+        }
+        return .allow
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        didFailProvisionalNavigation navigation: WKNavigation!,
+        withError error: any Error
+    ) {
+        let nsError = error as NSError
+        // NSURLErrorCancelled and WebKit's "frame load interrupted" (102) fire for
+        // navigations we cancelled ourselves or redirect races — not real failures.
+        if nsError.code == NSURLErrorCancelled || nsError.code == 102 { return }
+        finish(url: nil, error: error)
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        window = nil
+        NSApp.setActivationPolicy(previousActivationPolicy)
+        // nil URL with nil error signals a user cancel.
+        completion?(nil, nil)
+        completion = nil
     }
 }
 
@@ -487,8 +641,7 @@ final class SnapshotStore: ObservableObject {
     private var pollTask: Task<Void, Never>?
     private var client: QuestradeClient?
 
-    private var authSession: ASWebAuthenticationSession?
-    private let contextProvider = AuthContextProvider()
+    private var loginWindowController: OAuthLoginWindowController?
 
     init() {
         clientID = UserDefaults.standard.string(forKey: Self.clientIDKey) ?? ""
@@ -513,6 +666,10 @@ final class SnapshotStore: ObservableObject {
     }
 
     func startOAuthLogin() {
+        // A login window is already open (auto-triggered logins can arrive from
+        // both the poll loop and the manual refresh button) — don't stack another.
+        guard !isLoginInProgress else { return }
+
         let trimmedClientID = clientID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedClientID.isEmpty else {
             errorMessage = "Enter your Questrade API consumer key first."
@@ -531,23 +688,25 @@ final class SnapshotStore: ObservableObject {
         isLoginInProgress = true
         errorMessage = nil
 
-        let handler: @Sendable (URL?, (any Error)?) -> Void = { [weak self] callbackURL, error in
+        let controller = OAuthLoginWindowController()
+        loginWindowController = controller
+        controller.begin(url: authURL) { [weak self] callbackURL, error in
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.isLoginInProgress = false
+                self.loginWindowController = nil
 
                 if let error {
-                    let nsError = error as NSError
-                    if nsError.domain == ASWebAuthenticationSessionErrorDomain,
-                       nsError.code == ASWebAuthenticationSessionError.canceledLogin.rawValue {
-                        return
-                    }
                     self.errorMessage = "Login failed: \(error.localizedDescription)"
                     return
                 }
 
-                guard let callbackURL,
-                      let comps = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false),
+                guard let callbackURL else {
+                    // Window closed without completing — user cancelled.
+                    return
+                }
+
+                guard let comps = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false),
                       let code = comps.queryItems?.first(where: { $0.name == "code" })?.value else {
                     self.errorMessage = "Login failed: no authorization code received."
                     return
@@ -556,17 +715,6 @@ final class SnapshotStore: ObservableObject {
                 await self.exchangeCodeForToken(code: code, clientID: trimmedClientID)
             }
         }
-
-        let session = ASWebAuthenticationSession(
-            url: authURL,
-            callbackURLScheme: oauthCallbackScheme,
-            completionHandler: handler
-        )
-
-        session.presentationContextProvider = contextProvider
-        session.prefersEphemeralWebBrowserSession = false
-        authSession = session
-        session.start()
     }
 
     private func exchangeCodeForToken(code: String, clientID: String) async {
@@ -620,6 +768,7 @@ final class SnapshotStore: ObservableObject {
     }
 
     func reload() async {
+        guard isAuthenticated else { return }
         let storedToken = refreshToken
         guard !storedToken.isEmpty else { return }
 
@@ -702,7 +851,12 @@ final class SnapshotStore: ObservableObject {
     private func handleReloadError(_ error: Error) {
         if let qtError = error as? QuestradeClientError,
            case .authenticationRequired = qtError {
-            // Refresh token is expired/revoked — drop back to login screen
+            // Refresh token is expired/revoked — stop polling (or the poll loop
+            // would re-trigger login every cycle), discard the dead token, and
+            // drop back to the login screen.
+            pollTask?.cancel()
+            pollTask = nil
+            refreshToken = ""
             accounts = []
             snapshots = [:]
             isAuthenticated = false

@@ -533,3 +533,30 @@ import Testing
         )
     }
 }
+
+@Suite struct RefreshRejectionClassificationTests {
+
+    @Test func oauthErrorBodyIsAuthFailure() {
+        let body = #"{"error": "invalid_grant"}"#.data(using: .utf8)!
+        #expect(QuestradeClient.isOAuthErrorBody(body))
+    }
+
+    @Test func oauthErrorWithDescriptionIsAuthFailure() {
+        let body = #"{"error": "invalid_client", "error_description": "unknown client"}"#.data(using: .utf8)!
+        #expect(QuestradeClient.isOAuthErrorBody(body))
+    }
+
+    @Test func wafHTMLBodyIsNotAuthFailure() {
+        let body = "<html><head><title>Access Denied</title></head><body>blocked</body></html>".data(using: .utf8)!
+        #expect(!QuestradeClient.isOAuthErrorBody(body))
+    }
+
+    @Test func emptyBodyIsNotAuthFailure() {
+        #expect(!QuestradeClient.isOAuthErrorBody(Data()))
+    }
+
+    @Test func unrelatedJSONBodyIsNotAuthFailure() {
+        let body = #"{"message": "Bad Request"}"#.data(using: .utf8)!
+        #expect(!QuestradeClient.isOAuthErrorBody(body))
+    }
+}
